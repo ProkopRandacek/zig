@@ -37,6 +37,8 @@ pub fn append(opts: @This(), buffer: *std.ArrayList(u8)) Allocator.Error!void {
         \\pub const zig_version_string = "{s}";
         \\pub const zig_backend = std.builtin.CompilerBackend.{p_};
         \\
+        \\pub var fuzzStackContext: u64 = 0;
+        \\
         \\pub const output_mode = std.builtin.OutputMode.{p_};
         \\pub const link_mode = std.builtin.LinkMode.{p_};
         \\pub const is_test = {};

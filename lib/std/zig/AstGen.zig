@@ -9988,6 +9988,30 @@ fn callExpr(
         break :blk .auto;
     };
 
+    // import statement
+    const buffer_ref = try gz.addStrTok(.import, (try strRawAsString(astgen, "builtin")).index, node);
+
+    // field access
+    const access = try gz.addPlNode(.field_ptr, node, Zir.Inst.Field{
+        .lhs = buffer_ref,
+        .field_name_start = (try strRawAsString(astgen, "fuzzStackContext")).index,
+    });
+
+    // load
+    const loaded = try gz.addUnNode(.load, access, node);
+
+    // xor
+    const xored = try gz.addPlNode(.xor, node, Zir.Inst.Bin{
+        .lhs = try gz.addInt(69),
+        .rhs = loaded,
+    });
+
+    // store
+    _ = try gz.addPlNode(.store_node, node, Zir.Inst.Bin{
+        .lhs = access,
+        .rhs = xored,
+    });
+
     {
         astgen.advanceSourceCursor(astgen.tree.tokens.items(.start)[call.ast.lparen]);
         const line = astgen.source_line - gz.decl_line;
@@ -10006,6 +10030,12 @@ fn callExpr(
     const call_inst = call_index.toRef();
     try gz.astgen.instructions.append(astgen.gpa, undefined);
     try gz.instructions.append(astgen.gpa, call_index);
+
+    // store the old value
+    _ = try gz.addPlNode(.store_node, node, Zir.Inst.Bin{
+        .lhs = access,
+        .rhs = loaded,
+    });
 
     const scratch_top = astgen.scratch.items.len;
     defer astgen.scratch.items.len = scratch_top;
@@ -11633,6 +11663,40 @@ fn strLitAsString(astgen: *AstGen, str_lit_token: Ast.TokenIndex) !IndexSlice {
     const str_index: u32 = @intCast(string_bytes.items.len);
     const token_bytes = astgen.tree.tokenSlice(str_lit_token);
     try astgen.parseStrLit(str_lit_token, string_bytes, token_bytes, 0);
+    const key: []const u8 = string_bytes.items[str_index..];
+    if (std.mem.indexOfScalar(u8, key, 0)) |_| return .{
+        .index = @enumFromInt(str_index),
+        .len = @intCast(key.len),
+    };
+    const gop = try astgen.string_table.getOrPutContextAdapted(gpa, key, StringIndexAdapter{
+        .bytes = string_bytes,
+    }, StringIndexContext{
+        .bytes = string_bytes,
+    });
+    if (gop.found_existing) {
+        string_bytes.shrinkRetainingCapacity(str_index);
+        return .{
+            .index = @enumFromInt(gop.key_ptr.*),
+            .len = @intCast(key.len),
+        };
+    } else {
+        gop.key_ptr.* = str_index;
+        // Still need a null byte because we are using the same table
+        // to lookup null terminated strings, so if we get a match, it has to
+        // be null terminated for that to work.
+        try string_bytes.append(gpa, 0);
+        return .{
+            .index = @enumFromInt(str_index),
+            .len = @intCast(key.len),
+        };
+    }
+}
+
+fn strRawAsString(astgen: *AstGen, raw_str: []const u8) !IndexSlice {
+    const gpa = astgen.gpa;
+    const string_bytes = &astgen.string_bytes;
+    const str_index: u32 = @intCast(string_bytes.items.len);
+    try string_bytes.appendSlice(astgen.gpa, raw_str);
     const key: []const u8 = string_bytes.items[str_index..];
     if (std.mem.indexOfScalar(u8, key, 0)) |_| return .{
         .index = @enumFromInt(str_index),
