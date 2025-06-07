@@ -30,6 +30,7 @@ const Compilation = @import("../Compilation.zig");
 const Zir = std.zig.Zir;
 const Zoir = std.zig.Zoir;
 const ZonGen = std.zig.ZonGen;
+const opt = @import("../opt.zig");
 
 zcu: *Zcu,
 
@@ -1750,6 +1751,16 @@ pub fn linkerUpdateFunc(pt: Zcu.PerThread, func_index: InternPool.Index, air: *A
     legalize: {
         try air.legalize(pt, @import("../codegen.zig").legalizeFeatures(pt, nav_index) orelse break :legalize);
     }
+
+    std.debug.print("Function: {}: {}\n", .{
+        ip.getNav(zcu.funcInfo(func_index).owner_nav).fqn.fmt(ip),
+        air.instructions.len,
+    });
+
+    const oil = try opt.optimize(air, gpa);
+    oil.print();
+
+    std.process.fatal("Job is done", .{});
 
     var liveness = try Air.Liveness.analyze(zcu, air.*, ip);
     defer liveness.deinit(gpa);
