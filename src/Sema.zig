@@ -2389,9 +2389,11 @@ fn failWithErrorSetCodeMissing(
     dest_err_set_ty: Type,
     src_err_set_ty: Type,
 ) CompileError {
-    const pt = sema.pt;
-    return sema.fail(block, src, "expected type '{}', found type '{}'", .{
-        dest_err_set_ty.fmt(pt), src_err_set_ty.fmt(pt),
+    var cmpctx: Type.Comparison = .init(sema.gpa, sema.pt);
+    cmpctx.addType(src_err_set_ty) catch @panic("TODO");
+    cmpctx.addType(dest_err_set_ty) catch @panic("TODO");
+    return sema.fail(block, src, "expected type '{}', found type '{}', where {}", .{
+        cmpctx.formatTypeDeduped(dest_err_set_ty), cmpctx.formatTypeDeduped(src_err_set_ty), cmpctx.formatPlaceholders(),
     });
 }
 
@@ -29320,7 +29322,12 @@ fn coerceExtra(
     }
 
     const msg = msg: {
-        const msg = try sema.errMsg(inst_src, "expected type '{}', found '{}'", .{ dest_ty.fmt(pt), inst_ty.fmt(pt) });
+        var cmpctx: Type.Comparison = .init(sema.gpa, sema.pt);
+        cmpctx.addType(dest_ty) catch @panic("TODO");
+        cmpctx.addType(inst_ty) catch @panic("TODO");
+        const msg = try sema.errMsg(inst_src, "expected type '{}' but found '{}', where {}", .{
+            cmpctx.formatTypeDeduped(dest_ty), cmpctx.formatTypeDeduped(inst_ty), cmpctx.formatPlaceholders(),
+        });
         errdefer msg.destroy(sema.gpa);
 
         if (!can_coerce_to) {

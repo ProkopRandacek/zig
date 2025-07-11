@@ -4069,6 +4069,439 @@ pub fn isNullFromType(ty: Type, zcu: *const Zcu) ?bool {
     return null;
 }
 
+const type_placeholders: [24]u21 = .{ 'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω' };
+
+fn collectSubtypes(ty: Type, pt: Zcu.PerThread, visited: *std.AutoArrayHashMap(Type, u32)) !void {
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+
+    const gop = try visited.getOrPut(ty);
+    if (gop.found_existing) {
+        gop.value_ptr.* += 1;
+    } else {
+        gop.value_ptr.* = 1;
+    }
+
+    switch (ip.indexToKey(ty.toIntern())) {
+        .ptr_type => try collectSubtypes(Type.fromInterned(ty.ptrInfo(zcu).child), pt, visited),
+        .array_type => |array_type| try collectSubtypes(Type.fromInterned(array_type.child), pt, visited),
+        .vector_type => |vector_type| try collectSubtypes(Type.fromInterned(vector_type.child), pt, visited),
+        .opt_type => |child| try collectSubtypes(Type.fromInterned(child), pt, visited),
+        .error_union_type => |error_union_type| {
+            try collectSubtypes(Type.fromInterned(error_union_type.error_set_type), pt, visited);
+            if (error_union_type.payload_type != .generic_poison_type) {
+                try collectSubtypes(Type.fromInterned(error_union_type.payload_type), pt, visited);
+            }
+        },
+        .tuple_type => |tuple| {
+            for (tuple.types.get(ip)) |field_ty| {
+                try collectSubtypes(Type.fromInterned(field_ty), pt, visited);
+            }
+        },
+        .func_type => |fn_info| {
+            const param_types = fn_info.param_types.get(&zcu.intern_pool);
+            for (param_types) |param_ty| {
+                if (param_ty != .generic_poison_type) {
+                    try collectSubtypes(Type.fromInterned(param_ty), pt, visited);
+                }
+            }
+
+            if (fn_info.return_type != .generic_poison_type) {
+                try collectSubtypes(Type.fromInterned(fn_info.return_type), pt, visited);
+            }
+        },
+        .anyframe_type => |child| try collectSubtypes(Type.fromInterned(child), pt, visited),
+
+        // leaf types
+        .undef,
+        .inferred_error_set_type,
+        .error_set_type,
+        .struct_type,
+        .union_type,
+        .opaque_type,
+        .enum_type,
+        .simple_type,
+        .int_type,
+        => {},
+
+        // values, not types
+        .simple_value,
+        .variable,
+        .@"extern",
+        .func,
+        .int,
+        .err,
+        .error_union,
+        .enum_literal,
+        .enum_tag,
+        .empty_enum_value,
+        .float,
+        .ptr,
+        .slice,
+        .opt,
+        .aggregate,
+        .un,
+        // memoization, not types
+        .memoized_call,
+        => unreachable,
+    }
+}
+
+fn shouldDedupeType(ty: Type, ctx: *Comparison) !Comparison.DedupeEntry {
+    if (ctx.subtype_occurrences.get(ty)) |occ| {
+        const pt = ctx.pt;
+
+        if (ctx.type_dedupe_cache.getEntry(ty)) |entry| {
+            return entry.value_ptr.*;
+        }
+
+        var counting = std.io.countingWriter(std.io.null_writer);
+        const writer = counting.writer();
+        print(ty, writer, pt) catch unreachable; // we are writing into a counting writer, it should never fail
+        const type_len = counting.bytes_written;
+        const saved_bytes = (type_len * (occ - 1));
+        const should_dedupe = saved_bytes > 8;
+
+        const entry: Comparison.DedupeEntry = if (should_dedupe) b:{
+            ctx.placeholder_index += 1;
+            break :b .{.dedupe = type_placeholders[ctx.placeholder_index-1]};
+        } else .{.dont_dedupe = {} };
+
+        try ctx.type_dedupe_cache.put(ty, entry);
+
+        return entry;
+    } else {
+        return .{ .dont_dedupe = {} };
+    }
+}
+
+pub fn printWithDedupe(
+    ty: Type,
+    writer: anytype,
+    ctx: *Comparison,
+) !void {
+    const pt = ctx.pt;
+
+    switch (try shouldDedupeType(ty, ctx)) {
+        .dont_dedupe => {},
+        .dedupe => |placeholder| {
+            const ret = try writer.print("{u}", .{placeholder});
+            return ret;
+        }
+    }
+
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    switch (ip.indexToKey(ty.toIntern())) {
+        .undef => try writer.writeAll("@as(type, undefined)"),
+        .int_type => |int_type| {
+            const sign_char: u8 = switch (int_type.signedness) {
+                .signed => 'i',
+                .unsigned => 'u',
+            };
+            try writer.print("{c}{d}", .{ sign_char, int_type.bits });
+        },
+        .ptr_type => {
+            const info = ty.ptrInfo(zcu);
+
+            if (info.sentinel != .none) switch (info.flags.size) {
+                .one, .c => unreachable,
+                .many => try writer.print("[*:{}]", .{Value.fromInterned(info.sentinel).fmtValue(pt)}),
+                .slice => try writer.print("[:{}]", .{Value.fromInterned(info.sentinel).fmtValue(pt)}),
+            } else switch (info.flags.size) {
+                .one => try writer.writeAll("*"),
+                .many => try writer.writeAll("[*]"),
+                .c => try writer.writeAll("[*c]"),
+                .slice => try writer.writeAll("[]"),
+            }
+            if (info.flags.is_allowzero and info.flags.size != .c) try writer.writeAll("allowzero ");
+            if (info.flags.alignment != .none or
+                info.packed_offset.host_size != 0 or
+                info.flags.vector_index != .none)
+            {
+                const alignment = if (info.flags.alignment != .none)
+                    info.flags.alignment
+                else
+                    Type.fromInterned(info.child).abiAlignment(pt.zcu);
+                try writer.print("align({d}", .{alignment.toByteUnits() orelse 0});
+
+                if (info.packed_offset.bit_offset != 0 or info.packed_offset.host_size != 0) {
+                    try writer.print(":{d}:{d}", .{
+                        info.packed_offset.bit_offset, info.packed_offset.host_size,
+                    });
+                }
+                if (info.flags.vector_index == .runtime) {
+                    try writer.writeAll(":?");
+                } else if (info.flags.vector_index != .none) {
+                    try writer.print(":{d}", .{@intFromEnum(info.flags.vector_index)});
+                }
+                try writer.writeAll(") ");
+            }
+            if (info.flags.address_space != .generic) {
+                try writer.print("addrspace(.{s}) ", .{@tagName(info.flags.address_space)});
+            }
+            if (info.flags.is_const) try writer.writeAll("const ");
+            if (info.flags.is_volatile) try writer.writeAll("volatile ");
+
+            try printWithDedupe(Type.fromInterned(info.child), writer, ctx);
+        },
+        .array_type => |array_type| {
+            if (array_type.sentinel == .none) {
+                try writer.print("[{d}]", .{array_type.len});
+                try printWithDedupe(Type.fromInterned(array_type.child), writer, ctx);
+            } else {
+                try writer.print("[{d}:{}]", .{
+                    array_type.len,
+                    Value.fromInterned(array_type.sentinel).fmtValue(pt),
+                });
+                try printWithDedupe(Type.fromInterned(array_type.child), writer, ctx);
+            }
+        },
+        .vector_type => |vector_type| {
+            try writer.print("@Vector({d}, ", .{vector_type.len});
+            try printWithDedupe(Type.fromInterned(vector_type.child), writer, ctx);
+            try writer.writeAll(")");
+        },
+        .opt_type => |child| {
+            try writer.writeByte('?');
+            try printWithDedupe(Type.fromInterned(child), writer, ctx);
+        },
+        .error_union_type => |error_union_type| {
+            try printWithDedupe(Type.fromInterned(error_union_type.error_set_type), writer, ctx);
+            try writer.writeByte('!');
+            if (error_union_type.payload_type == .generic_poison_type) {
+                try writer.writeAll("anytype");
+            } else {
+                try printWithDedupe(Type.fromInterned(error_union_type.payload_type), writer, ctx);
+            }
+        },
+        .inferred_error_set_type => |func_index| {
+            const func_nav = ip.getNav(zcu.funcInfo(func_index).owner_nav);
+            try writer.print("@typeInfo(@typeInfo(@TypeOf({})).@\"fn\".return_type.?).error_union.error_set", .{
+                func_nav.fqn.fmt(ip),
+            });
+        },
+        .error_set_type => |error_set_type| {
+            const names = error_set_type.names;
+            try writer.writeAll("error{");
+            for (names.get(ip), 0..) |name, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{}", .{name.fmt(ip)});
+            }
+            try writer.writeAll("}");
+        },
+        .simple_type => |s| switch (s) {
+            .f16,
+            .f32,
+            .f64,
+            .f80,
+            .f128,
+            .usize,
+            .isize,
+            .c_char,
+            .c_short,
+            .c_ushort,
+            .c_int,
+            .c_uint,
+            .c_long,
+            .c_ulong,
+            .c_longlong,
+            .c_ulonglong,
+            .c_longdouble,
+            .anyopaque,
+            .bool,
+            .void,
+            .type,
+            .anyerror,
+            .comptime_int,
+            .comptime_float,
+            .noreturn,
+            .adhoc_inferred_error_set,
+            => try writer.writeAll(@tagName(s)),
+
+            .null,
+            .undefined,
+            => try writer.print("@TypeOf({s})", .{@tagName(s)}),
+
+            .enum_literal => try writer.writeAll("@Type(.enum_literal)"),
+
+            .generic_poison => unreachable,
+        },
+        .struct_type => {
+            const name = ip.loadStructType(ty.toIntern()).name;
+            try writer.print("{}", .{name.fmt(ip)});
+        },
+        .tuple_type => |tuple| {
+            if (tuple.types.len == 0) {
+                try writer.writeAll("@TypeOf(.{})");
+            } else {
+                try writer.writeAll("struct {");
+                for (tuple.types.get(ip), tuple.values.get(ip), 0..) |field_ty, val, i| {
+                    try writer.writeAll(if (i == 0) " " else ", ");
+                    if (val != .none) try writer.writeAll("comptime ");
+                    try printWithDedupe(Type.fromInterned(field_ty), writer, ctx);
+                    if (val != .none) try writer.print(" = {}", .{Value.fromInterned(val).fmtValue(pt)});
+                }
+                try writer.writeAll(" }");
+            }
+        },
+
+        .union_type => {
+            const name = ip.loadUnionType(ty.toIntern()).name;
+            try writer.print("{}", .{name.fmt(ip)});
+        },
+        .opaque_type => {
+            const name = ip.loadOpaqueType(ty.toIntern()).name;
+            try writer.print("{}", .{name.fmt(ip)});
+        },
+        .enum_type => {
+            const name = ip.loadEnumType(ty.toIntern()).name;
+            try writer.print("{}", .{name.fmt(ip)});
+        },
+        .func_type => |fn_info| {
+            if (fn_info.is_noinline) {
+                try writer.writeAll("noinline ");
+            }
+            try writer.writeAll("fn (");
+            const param_types = fn_info.param_types.get(&zcu.intern_pool);
+            for (param_types, 0..) |param_ty, i| {
+                if (i != 0) try writer.writeAll(", ");
+                if (std.math.cast(u5, i)) |index| {
+                    if (fn_info.paramIsComptime(index)) {
+                        try writer.writeAll("comptime ");
+                    }
+                    if (fn_info.paramIsNoalias(index)) {
+                        try writer.writeAll("noalias ");
+                    }
+                }
+                if (param_ty == .generic_poison_type) {
+                    try writer.writeAll("anytype");
+                } else {
+                    try printWithDedupe(Type.fromInterned(param_ty), writer, ctx);
+                }
+            }
+            if (fn_info.is_var_args) {
+                if (param_types.len != 0) {
+                    try writer.writeAll(", ");
+                }
+                try writer.writeAll("...");
+            }
+            try writer.writeAll(") ");
+            if (fn_info.cc != .auto) print_cc: {
+                if (zcu.getTarget().cCallingConvention()) |ccc| {
+                    if (fn_info.cc.eql(ccc)) {
+                        try writer.writeAll("callconv(.c) ");
+                        break :print_cc;
+                    }
+                }
+                switch (fn_info.cc) {
+                    .auto, .async, .naked, .@"inline" => try writer.print("callconv(.{}) ", .{std.zig.fmtId(@tagName(fn_info.cc))}),
+                    else => try writer.print("callconv({any}) ", .{fn_info.cc}),
+                }
+            }
+            if (fn_info.return_type == .generic_poison_type) {
+                try writer.writeAll("anytype");
+            } else {
+                try printWithDedupe(Type.fromInterned(fn_info.return_type), writer, ctx);
+            }
+        },
+        .anyframe_type => |child| {
+            if (child == .none) return writer.writeAll("anyframe");
+            try writer.writeAll("anyframe->");
+            try printWithDedupe(Type.fromInterned(child), writer, ctx);
+        },
+
+        // values, not types
+        .simple_value,
+        .variable,
+        .@"extern",
+        .func,
+        .int,
+        .err,
+        .error_union,
+        .enum_literal,
+        .enum_tag,
+        .empty_enum_value,
+        .float,
+        .ptr,
+        .slice,
+        .opt,
+        .aggregate,
+        .un,
+        // memoization, not types
+        .memoized_call,
+        => unreachable,
+    }
+}
+
+pub const Comparison = struct {
+    subtype_occurrences: std.AutoArrayHashMap(Type, u32),
+    type_dedupe_cache: std.AutoArrayHashMap(Type, DedupeEntry),
+    pt: Zcu.PerThread,
+    placeholder_index: u32,
+
+    pub const DedupeEntry = union (enum) {
+        dont_dedupe: void,
+        dedupe: u21, // value is the placeholder letter
+    };
+
+    pub fn init(gpa: Allocator, pt: Zcu.PerThread) Comparison {
+        return .{
+            .subtype_occurrences = .init(gpa),
+            .type_dedupe_cache = .init(gpa),
+            .pt = pt,
+            .placeholder_index = 0,
+        };
+    }
+
+    pub fn addType(ctx: *Comparison, ty: Type) !void {
+        return collectSubtypes(ty, ctx.pt, &ctx.subtype_occurrences);
+    }
+
+    pub const Formatter = struct {
+        ty: Type,
+        ctx: *Comparison,
+
+        pub fn format(value: Comparison.Formatter, comptime fmt_string: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt_string;
+            _ = options;
+            try printWithDedupe(value.ty, writer, value.ctx);
+        }
+    };
+
+    pub fn formatTypeDeduped(ctx: *Comparison, ty: Type) Comparison.Formatter {
+        return .{ .ty = ty, .ctx = ctx };
+    }
+
+    pub const PlaceholdersFormatter = struct {
+        ctx: *Comparison,
+
+        pub fn format(value: Comparison.PlaceholdersFormatter, comptime fmt_string: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt_string;
+            _ = options;
+            var iter = value.ctx.type_dedupe_cache.iterator();
+            var i: u32 = 0;
+            while (iter.next()) |e| {
+                switch (e.value_ptr.*) {
+                    .dont_dedupe => {},
+                    .dedupe => |placeholder| {
+                        if (i != 0) {
+                            try writer.writeAll(", ");
+                        }
+                        try writer.print("{u} = ", .{ placeholder });
+                        try e.key_ptr.print(writer, value.ctx.pt);
+                        i += 1;
+                    }
+                }
+            }
+        }
+    };
+
+    pub fn formatPlaceholders(ctx: *Comparison) Comparison.PlaceholdersFormatter {
+        return .{ .ctx = ctx };
+    }
+};
+
 pub const @"u1": Type = .{ .ip_index = .u1_type };
 pub const @"u8": Type = .{ .ip_index = .u8_type };
 pub const @"u16": Type = .{ .ip_index = .u16_type };
